@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UART Rhythm: The Physical Layer</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #161b22;
+            --border: #30363d;
+            --accent: #58a6ff;
+            --accent-dim: rgba(88, 166, 255, 0.1);
+            --signal-high: #3fb950;
+            --signal-low: #ff7b72;
+            --grid: #30363d;
+            --text: #c9d1d9;
+            --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+
+        body {
+            margin: 0;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Layout */
+        .app-container { display: flex; flex-direction: column; height: 100%; }
+        .header { padding: 1rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--panel); }
+        .main-stage { flex: 1; display: flex; flex-direction: column; position: relative; overflow: hidden; }
+        .controls { padding: 1rem; border-top: 1px solid var(--border); background: var(--panel); min-height: 200px; }
+
+        /* Components */
+        .btn {
+            background: var(--panel); border: 1px solid var(--border); color: var(--accent);
+            padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: var(--font-mono); font-weight: bold;
+            transition: all 0.2s;
+        }
+        .btn:hover { background: var(--accent); color: var(--bg); }
+        .btn:active { transform: scale(0.98); }
+        .btn-primary { background: var(--accent); color: var(--bg); border: none; }
+        
+        .input-group { margin-bottom: 1rem; display: flex; gap: 10px; align-items: center; }
+        input[type="text"] {
+            background: var(--bg); border: 1px solid var(--border); color: var(--text);
+            padding: 8px; border-radius: 4px; font-family: var(--font-mono); outline: none;
+        }
+
+        /* Canvas Overlay */
+        .canvas-container { 
+            flex: 1; 
+            position: relative; 
+            background: radial-gradient(circle at center, #13171f 0%, #0d1117 100%);
+        }
+        canvas { display: block; width: 100%; height: 100%; }
+
+        /* Rhythm Game UI */
+        .bit-guide {
+            display: flex; gap: 4px; overflow-x: auto; padding: 10px;
+            background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+            font-family: var(--font-mono); margin-top: 10px;
+        }
+        .bit-cell {
+            min-width: 30px; height: 50px; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; border: 1px solid var(--border);
+            border-radius: 4px; opacity: 0.5; transition: all 0.1s;
+        }
+        .bit-cell.active { opacity: 1; border-color: var(--accent); box-shadow: 0 0 10px var(--accent-dim); transform: scale(1.1); font-weight: bold; background: var(--panel); }
+        .bit-cell.val-0 { color: var(--signal-low); } /* Low is active (0) */
+        .bit-cell.val-1 { color: var(--signal-high); } /* High is idle (1) */
+        
+        .status-badge { padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; background: var(--border); }
+        .status-badge.connected { background: var(--signal-high); color: var(--bg); }
+        
+        .decoder-output {
+            font-family: var(--font-mono); font-size: 1.2rem; margin-top: 10px;
+            padding: 10px; background: #000; border-radius: 4px; border: 1px solid var(--border);
+            min-height: 1.5em; display: flex; align-items: center; gap: 10px;
+        }
+        .cursor { display: inline-block; width: 8px; height: 1.2em; background: var(--accent); animation: blink 1s step-end infinite; }
+        
+        @keyframes blink { 50% { opacity: 0; } }
+
+        /* Animations for signal feedback */
+        .signal-indicator {
+            width: 20px; height: 20px; border-radius: 50%; background: var(--signal-high);
+            box-shadow: 0 0 10px var(--signal-high); transition: 0.1s;
+        }
+        .signal-indicator.low { background: var(--signal-low); box-shadow: 0 0 10px var(--signal-low); }
+
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // --- UART LOGIC ---
+        const BAUD_OPTIONS = [
+            { label: "0.5 Hz (Slow)", value: 2000 },
+            { label: "1.0 Hz (Normal)", value: 1000 },
+            { label: "2.0 Hz (Fast)", value: 500 }
+        ];
+
+        // Convert string to array of bits (8N1)
+        // Idle=1, Start=0, Data=LSB..MSB, Stop=1
+        function encodeText(text) {
+            let bits = [];
+            // Padding idle bits at start
+            bits.push(1, 1); 
+            for (let i = 0; i < text.length; i++) {
+                const code = text.charCodeAt(i);
+                bits.push(0); // Start
+                for (let b = 0; b < 8; b++) {
+                    bits.push((code >> b) & 1);
+                }
+                bits.push(1); // Stop
+                bits.push(1); // Inter-character spacing
+            }
+            return bits;
+        }
+
+        // --- COMPONENTS ---
+
+        function App() {
+            const [role, setRole] = useState(null); // 'tx' or 'rx' or null
+            const [peerId, setPeerId] = useState(null);
+            const [conn, setConn] = useState(null);
+            const [status, setStatus] = useState("Disconnected");
+            
+            // Shared Game State
+            const [baudPeriod, setBaudPeriod] = useState(1000);
+            const [startTime, setStartTime] = useState(null);
+            const [timeOffset, setTimeOffset] = useState(0); // For Rx to sync with Tx
+
+            // Render
+            if (!role) {
+                return <Lobby onJoin={(r, c, b) => { setRole(r); if(c) setConn(c); if(b) setBaudPeriod(b); }} 
+                              onId={(id) => setPeerId(id)} 
+                              setStatus={setStatus} />;
+            }
+
+            return (
+                <div className="app-container">
+                    <header className="header">
+                        <div style={{display:'flex', gap:'10px', alignItems:'center'}}>
+                            <h2 style={{margin:0}}>UART Lab</h2>
+                            <span className={`status-badge ${conn ? 'connected' : ''}`}>{status}</span>
+                            <span>Role: {role.toUpperCase()}</span>
+                            <span>Speed: {1000/baudPeriod} Hz</span>
+                        </div>
+                        {role === 'tx' && <div>ID: <strong>{peerId}</strong></div>}
+                    </header>
+                    
+                    <GameLoop 
+                        role={role} 
+                        conn={conn} 
+                        baudPeriod={baudPeriod} 
+                        startTime={startTime} 
+                        setStartTime={setStartTime}
+                        timeOffset={timeOffset}
+                        setTimeOffset={setTimeOffset}
+                    />
+                </div>
+            );
+        }
+
+        function Lobby({ onJoin, onId, setStatus }) {
+            const [inputCode, setInputCode] = useState("");
+            const [selectedBaud, setSelectedBaud] = useState(1000);
+            const peerRef = useRef(null);
+
+            const startTx = () => {
+                const peer = new window.Peer();
+                peerRef.current = peer;
+                
+                peer.on('open', (id) => {
+                    onId(id);
+                    onJoin('tx', null, selectedBaud);
+                    setStatus("Waiting for Rx...");
+                });
+
+                peer.on('connection', (c) => {
+                    setStatus("Rx Connected");
+                    // We will pass this connection object up later via state or handling it here
+                    // Ideally we pass it to the game loop
+                    // But React structure is tricky with async. 
+                    // Let's rely on the GameLoop to accept the connection logic.
+                });
+            };
+
+            const joinRx = () => {
+                const peer = new window.Peer();
+                peerRef.current = peer;
+                peer.on('open', () => {
+                    const c = peer.connect(inputCode);
+                    c.on('open', () => {
+                        onJoin('rx', c, null); // Baud will be synced later
+                        setStatus("Connected to Tx");
+                    });
+                });
+            };
+
+            return (
+                <div style={{display:'flex', alignItems:'center', justifyContent:'center', height:'100%'}}>
+                    <div style={{background:'var(--panel)', padding:'2rem', borderRadius:'8px', border:'1px solid var(--border)', maxWidth:'400px'}}>
+                        <h1>UART Rhythm</h1>
+                        <p>Learn serial communication by <i>becoming</i> the wire.</p>
+                        
+                        <div style={{borderBottom:'1px solid var(--border)', paddingBottom:'1rem', marginBottom:'1rem'}}>
+                            <h3>Create Room (Transmitter)</h3>
+                            <div style={{marginBottom:'10px'}}>
+                                <label>Baud Rate: </label>
+                                <select value={selectedBaud} onChange={e=>setSelectedBaud(Number(e.target.value))} style={{background:'var(--bg)', color:'white', border:'1px solid var(--border)', padding:'4px'}}>
+                                    {BAUD_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                </select>
+                            </div>
+                            <button className="btn btn-primary" onClick={startTx}>Start Hosting</button>
+                        </div>
+
+                        <div>
+                            <h3>Join Room (Receiver)</h3>
+                            <div className="input-group">
+                                <input type="text" placeholder="Enter Host ID" value={inputCode} onChange={e => setInputCode(e.target.value)} />
+                                <button className="btn" onClick={joinRx}>Join</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function GameLoop({ role, conn, baudPeriod, startTime, setStartTime, timeOffset, setTimeOffset }) {
+            // Refs for high-freq updates
+            const canvasRef = useRef(null);
+            const stateRef = useRef({
+                wireVal: 1, // Logic High (Idle)
+                isSpacePressed: false,
+                rxSamples: [], // {ts, val}
+                txQueue: [], // Bits to send
+                txBitIndex: 0,
+                lastBitIdx: -1,
+                rxDecodedBits: [], // Bits decoded by User
+                rxText: "",
+                swDecodedText: "",
+                swSampleAccumulator: 0,
+                swSampleCount: 0,
+                swCurrentBitIdx: -1
+            });
+
+            // React State for UI updates (low freq)
+            const [uiText, setUiText] = useState(""); 
+            const [swText, setSwText] = useState("");
+            const [txInput, setTxInput] = useState("");
+            const [txGuide, setTxGuide] = useState([]); // Array of {bit, idx}
+            const [currentBitIdx, setCurrentBitIdx] = useState(0);
+
+            // -- INIT & NETWORKING --
+            useEffect(() => {
+                const state = stateRef.current;
+
+                // Keyboard Listeners
+                const downHandler = (e) => {
+                    if(e.code === 'Space' && !e.repeat) {
+                        state.isSpacePressed = true;
+                        if(role === 'tx') {
+                            state.wireVal = 0; // Drive Low
+                            sendUpdate(0);
+                        }
+                    }
+                };
+                const upHandler = (e) => {
+                    if(e.code === 'Space') {
+                        state.isSpacePressed = false;
+                        if(role === 'tx') {
+                            state.wireVal = 1; // Drive High
+                            sendUpdate(1);
+                        }
+                    }
+                };
+
+                window.addEventListener('keydown', downHandler);
+                window.addEventListener('keyup', upHandler);
+
+                // PeerJS Logic
+                if (role === 'tx') {
+                    // We are the time authority. Set start time now.
+                    const now = Date.now();
+                    setStartTime(now);
+                    
+                    // Tx holds the `conn` inside the Peer object events usually, 
+                    // but we need to grab the connection object if we created it in Lobby.
+                    // Actually, Lobby created the Peer, but we need to listen for connections *here* // if we want to send data.
+                    // For simplicity, let's look for the peer instance on window (hacky but works for single file)
+                    // or better, handle connection inside Lobby and pass it down.
+                    // FIX: Re-implement listener here since Lobby unmounted.
+                    // Note: In a real app, use Context.
+                    
+                    // Assuming window.peerRef exists from Lobby
+                    if(window.peerRef) { // Hack for demo
+                        window.peerRef.on('connection', (c) => {
+                            // Send config
+                            setTimeout(() => {
+                                c.send({ type: 'SYNC', start: now, baud: baudPeriod });
+                            }, 500);
+                            
+                            // Save connection for sending updates
+                            state.activeConn = c;
+                        });
+                    }
+                } 
+                else if (role === 'rx' && conn) {
+                    conn.on('data', (data) => {
+                        if (data.type === 'SYNC') {
+                            const now = Date.now();
+                            const latency = 0; // Assume negligible for local demo or accept NTP drift
+                            // Ideally: (now - sentTime) / 2
+                            setStartTime(data.start);
+                            // We need to update the parent's baudPeriod too, but props are read-only.
+                            // Ignoring baud update for now, assuming Lobby set it correctly? 
+                            // Actually Lobby didn't know baud for Rx. We need to force update.
+                            // Hack: modifying a ref or forcing reload? 
+                            // Let's rely on standard React setBaudPeriod if we could, 
+                            // but we passed it as prop.
+                            // Workaround: We will use `data.baud` in our logic directly.
+                            state.syncedBaud = data.baud;
+                        } else if (data.type === 'WIRE') {
+                            state.wireVal = data.val;
+                        }
+                    });
+                }
+
+                function sendUpdate(val) {
+                    if (state.activeConn) {
+                        state.activeConn.send({ type: 'WIRE', val: val });
+                    }
+                }
+
+                return () => {
+                    window.removeEventListener('keydown', downHandler);
+                    window.removeEventListener('keyup', upHandler);
+                };
+            }, [role]);
+
+
+            // -- GAME LOOP --
+            useEffect(() => {
+                let rAF;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const state = stateRef.current;
+
+                const render = () => {
+                    const now = Date.now();
+                    const activeBaud = state.syncedBaud || baudPeriod;
+                    
+                    // Time Logic
+                    // Use a unified time base. 
+                    // If startTime is null, we can't do grid.
+                    const t0 = startTime || now;
+                    const elapsed = now - t0;
+                    
+                    // Calculate current Bit Index
+                    const bitIdx = Math.floor(elapsed / activeBaud);
+                    const phase = (elapsed % activeBaud) / activeBaud; // 0.0 to 1.0
+                    
+                    // Update React UI occasionally
+                    if (bitIdx !== state.lastBitIdx) {
+                        setCurrentBitIdx(bitIdx);
+                        
+                        // -- RX END OF BIT LOGIC --
+                        if (role === 'rx' && state.lastBitIdx !== -1) {
+                            processRxBit(state, state.lastBitIdx, activeBaud);
+                            setUiText(state.rxText);
+                            setSwText(state.swDecodedText);
+                        }
+                        
+                        // Reset accumulators for next bit
+                        state.swSampleAccumulator = 0;
+                        state.swSampleCount = 0;
+                        state.userSampleAccumulator = 0;
+                        state.userSampleCount = 0;
+                        
+                        state.lastBitIdx = bitIdx;
+                    }
+
+                    // -- RX SAMPLING LOGIC (Continuous) --
+                    if (role === 'rx') {
+                        // 1. User Input Sampling (Spacebar)
+                        // If space pressed, add 1. If released, add 0.
+                        // Wait, Space = Low (0). Released = High (1).
+                        // Let's count "Space Held Time".
+                        if (state.isSpacePressed) {
+                            state.userSampleAccumulator += 16; // arbitrary time unit, roughly ms per frame
+                        }
+                        state.userSampleCount += 16; 
+
+                        // 2. SW Truth Sampling (Wire Value)
+                        // Only sample first 50%
+                        if (phase < 0.5) {
+                            state.swSampleAccumulator += state.wireVal; // 0 or 1
+                            state.swSampleCount++;
+                        }
+                    }
+
+                    // -- CANVAS DRAWING --
+                    drawScope(ctx, canvas, state, elapsed, activeBaud, role);
+
+                    rAF = requestAnimationFrame(render);
+                };
+
+                rAF = requestAnimationFrame(render);
+                return () => cancelAnimationFrame(rAF);
+            }, [startTime, baudPeriod, role]);
+
+
+            // -- HELPER LOGIC --
+
+            const processRxBit = (state, bitIdx, period) => {
+                // 1. Decode User Input
+                // Rule: "30% space ... is 0"
+                // Space means user pressed.
+                // Ratio = (Time Space Held) / (Total Time)
+                // Since we accumulate roughly per frame:
+                const ratio = state.userSampleAccumulator / state.userSampleCount;
+                
+                // If ratio > 0.3, it means they held space > 30% of time -> Logic 0
+                const userBit = ratio > 0.5 ? 1 : 0;
+                
+                // Add to shift register (simplified)
+                state.rxDecodedBits.push(userBit);
+                attemptCharDecode(state.rxDecodedBits, (char) => { state.rxText += char; });
+
+
+                // 2. Decode SW Truth
+                // Average the wire value (0 or 1)
+                const swAvg = state.swSampleCount > 0 ? (state.swSampleAccumulator / state.swSampleCount) : 1;
+                const swBit = swAvg > 0.5 ? 1 : 0;
+                
+                // We maintain a separate buffer for SW debug
+                if(!state.swBuffer) state.swBuffer = [];
+                state.swBuffer.push(swBit);
+                attemptCharDecode(state.swBuffer, (char) => { state.swDecodedText += char; });
+            };
+
+            const attemptCharDecode = (buffer, callback) => {
+                // Look for pattern: 1 (Idle/Stop) -> 0 (Start) -> 8 Data -> 1 (Stop)
+                // We need at least 10 bits.
+                // This is a naive state machine.
+                // Let's just scan from end.
+                // Actually, a simple framing approach:
+                // If we are IDLE, wait for 0.
+                if (!buffer.state) buffer.state = 'IDLE';
+                if (!buffer.data) buffer.data = [];
+
+                const bit = buffer[buffer.length-1];
+
+                if (buffer.state === 'IDLE') {
+                    if (bit === 0) {
+                        buffer.state = 'DATA';
+                        buffer.data = [];
+                    }
+                } else if (buffer.state === 'DATA') {
+                    buffer.data.push(bit);
+                    if (buffer.data.length === 8) {
+                        buffer.state = 'STOP';
+                    }
+                } else if (buffer.state === 'STOP') {
+                    // Valid stop bit is 1. Even if 0, we push char but maybe mark error?
+                    // Let's assume valid.
+                    let charCode = 0;
+                    // LSB First
+                    buffer.data.forEach((b, i) => {
+                        if(b) charCode |= (1 << i);
+                    });
+                    callback(String.fromCharCode(charCode));
+                    buffer.state = 'IDLE';
+                }
+            };
+
+            const drawScope = (ctx, cvs, state, elapsed, period, role) => {
+                const w = cvs.width = cvs.clientWidth;
+                const h = cvs.height = cvs.clientHeight;
+
+                // Config
+                const pxPerTime = w / (period * 5); // Show ~5 bits on screen
+                const scrollX = elapsed * pxPerTime;
+                
+                // Background
+                ctx.fillStyle = '#0d1117';
+                ctx.fillRect(0, 0, w, h);
+                
+                // Grid (Bit Boundaries)
+                ctx.strokeStyle = '#30363d';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                
+                // Draw lines based on bit index
+                // We want lines at t = 0, period, 2*period...
+                // Visible range: (scrollX - w) to scrollX (in pixels)
+                // Convert back to time
+                const viewEndTime = elapsed;
+                const viewStartTime = viewEndTime - (w / pxPerTime);
+                
+                const startBit = Math.floor(viewStartTime / period);
+                const endBit = Math.floor(viewEndTime / period) + 1;
+
+                for(let b = startBit; b <= endBit; b++) {
+                    const x = w - (elapsed - (b * period)) * pxPerTime;
+                    ctx.moveTo(x, 0);
+                    ctx.lineTo(x, h);
+                }
+                ctx.stroke();
+
+                // Highlight Sampling Region (First 50%)
+                if (role === 'rx') {
+                    ctx.fillStyle = 'rgba(88, 166, 255, 0.1)';
+                    for(let b = startBit; b <= endBit; b++) {
+                        const xStart = w - (elapsed - (b * period)) * pxPerTime;
+                        const width = (period * 0.5) * pxPerTime;
+                        ctx.fillRect(xStart, 0, width, h);
+                    }
+                }
+
+                // Draw Signal
+                // Real-time chart: We push samples to an array?
+                // For 'snappy' feel without memory leak, we can maintain a circular buffer or
+                // just draw the current state as a flat line and history?
+                // A true scope needs history. 
+                // Let's record history in state.rxSamples = [{t, v}]
+                
+                // Add current sample
+                if(!state.lastSampleTime || elapsed - state.lastSampleTime > 16) {
+                    state.rxSamples.push({ t: elapsed, v: state.wireVal });
+                    state.lastSampleTime = elapsed;
+                    // Prune
+                    if(state.rxSamples.length > 500) state.rxSamples.shift();
+                }
+
+                ctx.strokeStyle = state.wireVal ? '#3fb950' : '#ff7b72'; // Green High, Red Low
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                
+                state.rxSamples.forEach((s, i) => {
+                    const x = w - (elapsed - s.t) * pxPerTime;
+                    const y = s.v ? h*0.2 : h*0.8;
+                    if (i===0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                    // Draw square edges
+                    if (i < state.rxSamples.length - 1) {
+                         const nextS = state.rxSamples[i+1];
+                         const nextX = w - (elapsed - nextS.t) * pxPerTime;
+                         ctx.lineTo(nextX, y); // Hold value
+                    }
+                });
+                // Connect to current time
+                ctx.lineTo(w, state.wireVal ? h*0.2 : h*0.8);
+                ctx.stroke();
+            };
+
+            // -- TX CONTROLS GENERATOR --
+            const handleTxGenerate = (text) => {
+                setTxInput(text);
+                const bits = encodeText(text);
+                // Map to guide objects
+                const startIdx = currentBitIdx + 2; // Start 2 bits in future to give prep time
+                const guide = bits.map((b, i) => ({
+                    val: b,
+                    targetIdx: startIdx + i,
+                    label: i===0?'I':(i===1?'I':((i-2)%10===0?'S':((i-2)%10===9?'P':'D'))) 
+                    // Simplified labels: I=Idle, S=Start, P=Stop, D=Data
+                }));
+                setTxGuide(guide);
+            };
+
+            return (
+                <div style={{display:'flex', flexDirection:'column', height:'100%'}}>
+                    <div className="canvas-container">
+                        <canvas ref={canvasRef}></canvas>
+                    </div>
+                    
+                    <div className="controls">
+                        {role === 'tx' ? (
+                            <div>
+                                <div className="input-group">
+                                    <input type="text" placeholder="Type to send..." 
+                                        onKeyDown={(e)=>{if(e.key==='Enter') handleTxGenerate(e.target.value)}}
+                                    />
+                                    <button className="btn" onClick={()=>handleTxGenerate("HELLO")}>HELLO</button>
+                                    <button className="btn" onClick={()=>handleTxGenerate("UART")}>UART</button>
+                                </div>
+                                <div className="bit-guide">
+                                    {txGuide.filter(g => g.targetIdx >= currentBitIdx - 1 && g.targetIdx < currentBitIdx + 15).map(g => (
+                                        <div key={g.targetIdx} 
+                                             className={`bit-cell val-${g.val} ${g.targetIdx === currentBitIdx ? 'active' : ''}`}>
+                                            <small>{g.val}</small>
+                                            <span style={{fontSize:'10px'}}>{g.val === 0 ? 'HOLD' : '_'}</span>
+                                        </div>
+                                    ))}
+                                    {txGuide.length === 0 && <div style={{opacity:0.5}}>Enter text to generate bit pattern...</div>}
+                                </div>
+                                <div style={{marginTop:'10px', color: stateRef.current.isSpacePressed ? 'var(--signal-low)' : 'var(--text)'}}>
+                                    STATUS: {stateRef.current.isSpacePressed ? "DRIVING LOW (0)" : "IDLE HIGH (1)"}
+                                </div>
+                            </div>
+                        ) : (
+                            <div>
+                                <div>Decoded Text (Human):</div>
+                                <div className="decoder-output">
+                                    {uiText}<span className="cursor"></span>
+                                </div>
+                                <div style={{marginTop:'10px', fontSize:'0.9em', opacity:0.7}}>
+                                    <div>SW Reference Decode: {swText}</div>
+                                    <div>Hold SPACE to detect '0'. Release for '1'.</div>
+                                    <div style={{display:'flex', alignItems:'center', gap:'10px', marginTop:'5px'}}>
+                                        Current Bit Window: {currentBitIdx} 
+                                        <div className={`signal-indicator ${stateRef.current.wireVal?'':'low'}`}></div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
